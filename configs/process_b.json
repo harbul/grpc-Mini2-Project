@@ -1,0 +1,21 @@
+{
+  "identity": "B",
+  "role": "team_leader",
+  "team": "green",
+  "hostname": "localhost",
+  "port": 50052,
+  "neighbors": [
+    {
+      "process_id": "C",
+      "hostname": "localhost",
+      "port": 50053
+    },
+    {
+      "process_id": "D",
+      "hostname": "localhost",
+      "port": 50054
+    }
+  ],
+  "description": "Team Green Leader - coordinates workers C and D"
+}
+

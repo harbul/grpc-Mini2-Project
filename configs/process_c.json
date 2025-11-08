@@ -1,0 +1,10 @@
+{
+  "identity": "C",
+  "role": "worker",
+  "team": "green",
+  "hostname": "localhost",
+  "port": 50053,
+  "neighbors": [],
+  "description": "Team Green Worker - processes queries for Team Green data subset"
+}
+

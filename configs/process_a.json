@@ -1,0 +1,21 @@
+{
+  "identity": "A",
+  "role": "leader",
+  "team": "green",
+  "hostname": "localhost",
+  "port": 50051,
+  "neighbors": [
+    {
+      "process_id": "B",
+      "hostname": "localhost",
+      "port": 50052
+    },
+    {
+      "process_id": "E",
+      "hostname": "localhost",
+      "port": 50055
+    }
+  ],
+  "description": "Gateway/Leader process - receives client queries and coordinates Team Green and Team Pink"
+}
+

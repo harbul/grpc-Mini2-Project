@@ -1,0 +1,116 @@
+syntax = "proto3";
+
+package fire_service;
+
+// Represents a single air quality measurement (matches FireColumnModel fields)
+message FireMeasurement {
+    double latitude = 1;
+    double longitude = 2;
+    string datetime = 3;
+    string parameter = 4;              // e.g., "PM2.5", "PM10", "OZONE", "CO", "NO2", "SO2"
+    double concentration = 5;
+    string unit = 6;
+    double raw_concentration = 7;
+    int32 aqi = 8;
+    int32 category = 9;
+    string site_name = 10;
+    string agency_name = 11;
+    string aqs_code = 12;
+    string full_aqs_code = 13;
+}
+
+// Query filters (supports various query types)
+message QueryFilter {
+    // Site-based filters
+    repeated string site_names = 1;        // Filter by site names
+    repeated string aqs_codes = 2;         // Filter by AQS codes
+    repeated string agency_names = 3;      // Filter by agencies
+    
+    // Parameter filters
+    repeated string parameters = 4;        // Filter by parameters (PM2.5, PM10, etc.)
+    
+    // Geographic filters
+    double min_latitude = 5;
+    double max_latitude = 6;
+    double min_longitude = 7;
+    double max_longitude = 8;
+    
+    // Temporal filters
+    string min_datetime = 9;              // ISO format datetime
+    string max_datetime = 10;
+    
+    // Value filters
+    double min_concentration = 11;
+    double max_concentration = 12;
+    int32 min_aqi = 13;
+    int32 max_aqi = 14;
+}
+
+// Query request from client to gateway (Process A)
+message QueryRequest {
+    int64 request_id = 1;                  // Unique request identifier
+    QueryFilter filter = 2;                // Query filters
+    string query_type = 3;                 // "filter", "aggregate", "count", etc.
+    bool require_chunked = 4;              // Whether to use chunked responses
+    int32 max_results_per_chunk = 5;       // Chunk size if chunked
+}
+
+// Query response chunk (for chunked responses)
+message QueryResponseChunk {
+    int64 request_id = 1;
+    int32 chunk_number = 2;                // 0-based chunk index
+    bool is_last_chunk = 3;                // True if this is the final chunk
+    repeated FireMeasurement measurements = 4;
+    int32 total_chunks = 5;                // Total number of chunks (if known)
+    int64 total_results = 6;               // Total results across all chunks
+}
+
+// Internal request between processes (A->B, B->C, etc.)
+message InternalQueryRequest {
+    int64 request_id = 1;
+    string original_request_id = 2;        // Track original client request
+    QueryFilter filter = 3;
+    string query_type = 4;
+    string requesting_process = 5;         // Who sent this (for routing responses)
+}
+
+// Internal response between processes
+message InternalQueryResponse {
+    int64 request_id = 1;
+    string original_request_id = 2;
+    repeated FireMeasurement measurements = 3;
+    bool is_complete = 4;
+    string responding_process = 5;         // Who sent this response
+}
+
+// Status/control messages
+message StatusRequest {
+    int64 request_id = 1;
+    string action = 2;                     // "cancel", "status", "pause"
+}
+
+message StatusResponse {
+    int64 request_id = 1;
+    string status = 2;                     // "pending", "processing", "completed", "cancelled"
+    int32 chunks_delivered = 3;
+    int32 total_chunks = 4;
+}
+
+// Service definition
+service FireQueryService {
+    // Client -> Gateway (Process A): Submit a query
+    rpc Query(QueryRequest) returns (stream QueryResponseChunk);
+    
+    // Client -> Gateway: Cancel a request
+    rpc CancelRequest(StatusRequest) returns (StatusResponse);
+    
+    // Client -> Gateway: Check request status
+    rpc GetStatus(StatusRequest) returns (StatusResponse);
+    
+    // Internal: Process to Process communication
+    rpc InternalQuery(InternalQueryRequest) returns (InternalQueryResponse);
+    
+    // Internal: One-way notification (optional)
+    rpc Notify(InternalQueryRequest) returns (StatusResponse);
+}
+

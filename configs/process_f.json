@@ -1,0 +1,10 @@
+{
+  "identity": "F",
+  "role": "worker",
+  "team": "pink",
+  "hostname": "localhost",
+  "port": 50056,
+  "neighbors": [],
+  "description": "Team Pink Worker - processes queries for Team Pink data subset"
+}
+
