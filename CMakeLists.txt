@@ -4,10 +4,6 @@ project(mini2_grpc CXX)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
-# Find required packages
-find_package(Protobuf REQUIRED)
-find_package(gRPC CONFIG REQUIRED)
-
 # Proto files
 set(PROTO_PATH "${CMAKE_CURRENT_SOURCE_DIR}/proto")
 set(PROTO_FILE "${PROTO_PATH}/fire_service.proto")
@@ -22,10 +18,14 @@ set(GRPC_HDRS "${PROTO_PATH}/fire_service.grpc.pb.h")
 # If they're not generated, run:
 # protoc --cpp_out=. --grpc_out=. --plugin=protoc-gen-grpc=`which grpc_cpp_plugin` proto/fire_service.proto
 
+# Homebrew paths (for macOS)
+set(HOMEBREW_PREFIX "/opt/homebrew")
+include_directories("${HOMEBREW_PREFIX}/include")
+link_directories("${HOMEBREW_PREFIX}/lib")
+
 # Include directories
 include_directories(${CMAKE_CURRENT_SOURCE_DIR})
 include_directories(${PROTO_PATH})
-include_directories(${Protobuf_INCLUDE_DIRS})
 
 # Client executable
 add_executable(fire_client
@@ -34,11 +34,54 @@ add_executable(fire_client
     ${GRPC_SRCS}
 )
 
-# Link libraries
+# Link libraries directly
 target_link_libraries(fire_client
-    gRPC::grpc++
-    gRPC::grpc++_reflection
-    protobuf::libprotobuf
+    grpc++
+    grpc
+    protobuf
+    absl_log_internal_check_op
+    absl_leak_check
+    absl_die_if_null
+    absl_log_internal_conditions
+    absl_log_internal_message
+    absl_examine_stack
+    absl_log_internal_format
+    absl_log_internal_proto
+    absl_log_internal_nullguard
+    absl_log_internal_log_sink_set
+    absl_log_sink
+    absl_log_entry
+    absl_flags
+    absl_flags_internal
+    absl_flags_marshalling
+    absl_flags_reflection
+    absl_flags_config
+    absl_flags_program_name
+    absl_hash
+    absl_city
+    absl_low_level_hash
+    absl_raw_hash_set
+    absl_hashtablez_sampler
+    absl_exponential_biased
+    absl_synchronization
+    absl_graphcycles_internal
+    absl_stacktrace
+    absl_symbolize
+    absl_debugging_internal
+    absl_demangle_internal
+    absl_malloc_internal
+    absl_time
+    absl_civil_time
+    absl_time_zone
+    absl_strings
+    absl_strings_internal
+    absl_base
+    absl_spinlock_wait
+    absl_int128
+    absl_throw_delegate
+    absl_raw_logging_internal
+    absl_log_severity
+    pthread
 )
 
 # Set output directory
@@ -49,7 +92,6 @@ set_target_properties(fire_client PROPERTIES
 message(STATUS "====================================")
 message(STATUS "Mini2 gRPC C++ Client Build Config")
 message(STATUS "====================================")
-message(STATUS "Protobuf version: ${Protobuf_VERSION}")
 message(STATUS "Proto files: ${PROTO_FILE}")
 message(STATUS "Build type: ${CMAKE_BUILD_TYPE}")
 message(STATUS "====================================")
