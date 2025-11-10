@@ -1,31 +1,20 @@
+# Build artifacts
+build/
+*.o
+*.so
+*.dylib
+*.a
+*.exe
+
 # Python
 __pycache__/
 *.py[cod]
 *$py.class
-*.so
-.Python
-venv/
-env/
-ENV/
 *.egg-info/
-dist/
-build-python/
-data/
-# C++
-build/
-*.o
-*.a
-*.so
-*.dylib
-*.exe
-CMakeCache.txt
-CMakeFiles/
-cmake_install.cmake
-Makefile
-*.cmake
-!CMakeLists.txt
+venv/
+.Python
 
-# IDE
+# IDE and editors
 .vscode/
 .idea/
 *.swp
@@ -33,16 +22,20 @@ Makefile
 *~
 .DS_Store
 
-# gRPC generated files (keep them for now, but could regenerate)
-# proto/*_pb2.py
-# proto/*_pb2_grpc.py
+# Logs and temporary files
+*.log
+/tmp/
+*.tmp
+
+# Test binaries and debug files
+test_path_match
+test_firemodel
+a.out
+
+# Proto generated files (can be regenerated)
+# Uncomment if you want to regenerate these
 # proto/*.pb.cc
 # proto/*.pb.h
-
-# Logs
-*.log
-
-# Data files (if you add them)
+# proto/*_pb2.py
+# proto/*_pb2_grpc.py
 data/
-*.csv
-*.json.bak
