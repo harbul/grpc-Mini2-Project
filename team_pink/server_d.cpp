@@ -14,6 +14,7 @@
 #include <nlohmann/json.hpp>
 
 #include "../proto/fire_service.grpc.pb.h"
+#include "FireColumnModel.hpp"
 
 using grpc::Server;
 using grpc::ServerBuilder;
@@ -26,6 +27,7 @@ using fire_service::InternalQueryRequest;
 using fire_service::InternalQueryResponse;
 using fire_service::StatusRequest;
 using fire_service::StatusResponse;
+using fire_service::FireMeasurement;
 using json = nlohmann::json;
 
 /**
@@ -39,7 +41,8 @@ private:
     std::string team_;
     int port_;
     
-    // TODO: Add FireColumnModel member variable
+    // FireColumnModel for local data storage
+    FireColumnModel data_model_;
 
 public:
     FireQueryServiceImpl(const json& config) {
@@ -51,7 +54,13 @@ public:
         std::cout << "[" << process_id_ << "] Initialized as " << role_ 
                   << " for Team " << team_ << std::endl;
         
-        // TODO: Initialize FireColumnModel with Team Pink data subset
+        // Initialize FireColumnModel with Team Pink data subset
+        // For now, model is empty - data loading can be added later
+        std::cout << "[" << process_id_ << "] Data model initialized with " 
+                  << data_model_.measurementCount() << " measurements" << std::endl;
+        
+        // TODO: Load actual CSV data when available
+        // Example: data_model_.readFromDirectory("data/team_pink/");
     }
     
     /**
@@ -88,11 +97,71 @@ public:
         std::cout << "  Original request: " << request->original_request_id() << std::endl;
         std::cout << "  Query type: " << request->query_type() << std::endl;
         
-        // TODO: Query local FireColumnModel data
-        // TODO: Apply filters from request->filter()
-        // TODO: Convert results to FireMeasurement proto messages
+        // Query local FireColumnModel data
+        std::vector<std::size_t> matching_indices;
         
-        // For now, return empty response
+        if (request->has_filter()) {
+            const auto& filter = request->filter();
+            
+            // Filter by parameter (PM2.5, PM10, etc.) - use first parameter if specified
+            if (filter.parameters_size() > 0) {
+                const std::string& param = filter.parameters(0);
+                matching_indices = data_model_.getIndicesByParameter(param);
+                std::cout << "  Filtered by parameter '" << param 
+                         << "': " << matching_indices.size() << " matches" << std::endl;
+            }
+            // Filter by site name - use first site if specified
+            else if (filter.site_names_size() > 0) {
+                const std::string& site = filter.site_names(0);
+                matching_indices = data_model_.getIndicesBySite(site);
+                std::cout << "  Filtered by site '" << site 
+                         << "': " << matching_indices.size() << " matches" << std::endl;
+            }
+            // Filter by AQI range
+            else if (filter.min_aqi() > 0 || filter.max_aqi() > 0) {
+                const auto& all_aqis = data_model_.aqis();
+                for (std::size_t i = 0; i < all_aqis.size(); ++i) {
+                    int aqi = all_aqis[i];
+                    bool matches = true;
+                    
+                    if (filter.min_aqi() > 0 && aqi < filter.min_aqi()) {
+                        matches = false;
+                    }
+                    if (filter.max_aqi() > 0 && aqi > filter.max_aqi()) {
+                        matches = false;
+                    }
+                    
+                    if (matches) {
+                        matching_indices.push_back(i);
+                    }
+                }
+                std::cout << "  Filtered by AQI range: " << matching_indices.size() << " matches" << std::endl;
+            }
+        } else {
+            // No filter - return all measurements
+            for (std::size_t i = 0; i < data_model_.measurementCount(); ++i) {
+                matching_indices.push_back(i);
+            }
+        }
+        
+        // Convert results to FireMeasurement proto messages
+        for (std::size_t idx : matching_indices) {
+            auto* measurement = response->add_measurements();
+            measurement->set_latitude(data_model_.latitudes()[idx]);
+            measurement->set_longitude(data_model_.longitudes()[idx]);
+            measurement->set_datetime(data_model_.datetimes()[idx]);
+            measurement->set_parameter(data_model_.parameters()[idx]);
+            measurement->set_concentration(data_model_.concentrations()[idx]);
+            measurement->set_unit(data_model_.units()[idx]);
+            measurement->set_raw_concentration(data_model_.rawConcentrations()[idx]);
+            measurement->set_aqi(data_model_.aqis()[idx]);
+            measurement->set_category(data_model_.categories()[idx]);
+            measurement->set_site_name(data_model_.siteNames()[idx]);
+            measurement->set_agency_name(data_model_.agencyNames()[idx]);
+            measurement->set_aqs_code(data_model_.aqsCodes()[idx]);
+            measurement->set_full_aqs_code(data_model_.fullAqsCodes()[idx]);
+        }
+        
         response->set_request_id(request->request_id());
         response->set_original_request_id(request->original_request_id());
         response->set_is_complete(true);
