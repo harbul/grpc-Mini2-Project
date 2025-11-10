@@ -106,24 +106,31 @@ class FireQueryServiceImpl(fire_service_pb2_grpc.FireQueryServiceServicer):
         if request.HasField('filter'):
             filter_obj = request.filter
             
-            # Filter by parameter (PM2.5, PM10, etc.)
+            # Start with parameter or site filtering (OR logic for multiple parameters)
             if len(filter_obj.parameters) > 0:
-                param = filter_obj.parameters[0]
-                matching_indices = self.data_model.get_indices_by_parameter(param)
-            # Filter by site name
+                # Handle multiple parameters (OR logic - match any parameter)
+                all_param_indices = set()
+                for param in filter_obj.parameters:
+                    param_indices = self.data_model.get_indices_by_parameter(param)
+                    all_param_indices.update(param_indices)
+                matching_indices = list(all_param_indices)
             elif len(filter_obj.site_names) > 0:
+                # Filter by site name
                 site = filter_obj.site_names[0]
                 matching_indices = self.data_model.get_indices_by_site(site)
-            # Filter by AQI range
-            elif filter_obj.min_aqi > 0 or filter_obj.max_aqi > 0:
-                for i in range(self.data_model.measurement_count()):
-                    aqi = self.data_model.aqis[i]
+            else:
+                # No parameter/site filter - start with all measurements
+                matching_indices = list(range(self.data_model.measurement_count()))
+            
+            # Apply AQI range filter (AND logic - must also match AQI range)
+            if filter_obj.min_aqi > 0 or filter_obj.max_aqi > 0:
+                filtered_indices = []
+                for idx in matching_indices:
+                    aqi = self.data_model.aqis[idx]
                     if ((filter_obj.min_aqi == 0 or aqi >= filter_obj.min_aqi) and
                         (filter_obj.max_aqi == 0 or aqi <= filter_obj.max_aqi)):
-                        matching_indices.append(i)
-            else:
-                # No specific filter - return all
-                matching_indices = list(range(self.data_model.measurement_count()))
+                        filtered_indices.append(idx)
+                matching_indices = filtered_indices
         else:
             # No filter - return all measurements
             matching_indices = list(range(self.data_model.measurement_count()))

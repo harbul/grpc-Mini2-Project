@@ -10,6 +10,8 @@
 #include <memory>
 #include <string>
 #include <fstream>
+#include <set>
+#include <vector>
 #include <grpcpp/grpcpp.h>
 #include <nlohmann/json.hpp>
 
@@ -110,12 +112,18 @@ public:
         if (request->has_filter()) {
             const auto& filter = request->filter();
             
-            // Filter by parameter (PM2.5, PM10, etc.) - use first parameter if specified
+            // Start with parameter or site filtering (OR logic for multiple parameters)
             if (filter.parameters_size() > 0) {
-                const std::string& param = filter.parameters(0);
-                matching_indices = data_model_.getIndicesByParameter(param);
-                std::cout << "  Filtered by parameter '" << param 
-                         << "': " << matching_indices.size() << " matches" << std::endl;
+                // Handle multiple parameters (OR logic - match any parameter)
+                std::set<std::size_t> all_param_indices;
+                for (int i = 0; i < filter.parameters_size(); ++i) {
+                    const std::string& param = filter.parameters(i);
+                    auto param_indices = data_model_.getIndicesByParameter(param);
+                    all_param_indices.insert(param_indices.begin(), param_indices.end());
+                }
+                matching_indices.assign(all_param_indices.begin(), all_param_indices.end());
+                std::cout << "  Filtered by " << filter.parameters_size() << " parameter(s): " 
+                         << matching_indices.size() << " matches" << std::endl;
             }
             // Filter by site name - use first site if specified
             else if (filter.site_names_size() > 0) {
@@ -124,11 +132,19 @@ public:
                 std::cout << "  Filtered by site '" << site 
                          << "': " << matching_indices.size() << " matches" << std::endl;
             }
-            // Filter by AQI range
-            else if (filter.min_aqi() > 0 || filter.max_aqi() > 0) {
+            else {
+                // No parameter/site filter - start with all measurements
+                for (std::size_t i = 0; i < data_model_.measurementCount(); ++i) {
+                    matching_indices.push_back(i);
+                }
+            }
+            
+            // Apply AQI range filter (AND logic - must also match AQI range)
+            if (filter.min_aqi() > 0 || filter.max_aqi() > 0) {
+                std::vector<std::size_t> filtered_indices;
                 const auto& all_aqis = data_model_.aqis();
-                for (std::size_t i = 0; i < all_aqis.size(); ++i) {
-                    int aqi = all_aqis[i];
+                for (std::size_t idx : matching_indices) {
+                    int aqi = all_aqis[idx];
                     bool matches = true;
                     
                     if (filter.min_aqi() > 0 && aqi < filter.min_aqi()) {
@@ -139,10 +155,12 @@ public:
                     }
                     
                     if (matches) {
-                        matching_indices.push_back(i);
+                        filtered_indices.push_back(idx);
                     }
                 }
-                std::cout << "  Filtered by AQI range: " << matching_indices.size() << " matches" << std::endl;
+                matching_indices = filtered_indices;
+                std::cout << "  After AQI filter [" << filter.min_aqi() << "-" << filter.max_aqi() 
+                         << "]: " << matching_indices.size() << " matches" << std::endl;
             }
         } else {
             // No filter - return all measurements
