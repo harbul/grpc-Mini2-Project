@@ -1,0 +1,215 @@
+{
+  "metadata": {
+    "server": "localhost:50051",
+    "timestamp": "2025-11-14T19:16:20.195424",
+    "deployment": "single_computer"
+  },
+  "tests": {
+    "chunk_size_comparison": [
+      {
+        "test_name": "Medium Query (chunk_size=100)",
+        "total_time": 55.863,
+        "time_to_first_chunk": 2.046,
+        "total_measurements": 421606,
+        "total_chunks": 4217,
+        "throughput": 7547.2,
+        "avg_chunk_time": 0.0127,
+        "median_chunk_time": 0.0128,
+        "errors": []
+      },
+      {
+        "test_name": "Medium Query (chunk_size=500)",
+        "total_time": 13.588,
+        "time_to_first_chunk": 2.112,
+        "total_measurements": 421606,
+        "total_chunks": 844,
+        "throughput": 31027.48,
+        "avg_chunk_time": 0.0135,
+        "median_chunk_time": 0.0134,
+        "errors": []
+      },
+      {
+        "test_name": "Medium Query (chunk_size=1000)",
+        "total_time": 8.344,
+        "time_to_first_chunk": 1.842,
+        "total_measurements": 421606,
+        "total_chunks": 422,
+        "throughput": 50527.64,
+        "avg_chunk_time": 0.0152,
+        "median_chunk_time": 0.0147,
+        "errors": []
+      },
+      {
+        "test_name": "Medium Query (chunk_size=5000)",
+        "total_time": 3.4,
+        "time_to_first_chunk": 1.887,
+        "total_measurements": 421606,
+        "total_chunks": 85,
+        "throughput": 124007.56,
+        "avg_chunk_time": 0.0174,
+        "median_chunk_time": 0.0175,
+        "errors": []
+      }
+    ],
+    "query_complexity": [
+      {
+        "test_name": "Small Query (chunk_size=1000)",
+        "total_time": 4.292,
+        "time_to_first_chunk": 1.004,
+        "total_measurements": 224071,
+        "total_chunks": 225,
+        "throughput": 52209.34,
+        "avg_chunk_time": 0.0145,
+        "median_chunk_time": 0.0144,
+        "errors": []
+      },
+      {
+        "test_name": "Medium Query (chunk_size=1000)",
+        "total_time": 8.297,
+        "time_to_first_chunk": 2.158,
+        "total_measurements": 421606,
+        "total_chunks": 422,
+        "throughput": 50814.73,
+        "avg_chunk_time": 0.0144,
+        "median_chunk_time": 0.0141,
+        "errors": []
+      },
+      {
+        "test_name": "Large Query (chunk_size=1000)",
+        "total_time": 10.318,
+        "time_to_first_chunk": 4.741,
+        "total_measurements": 377165,
+        "total_chunks": 378,
+        "throughput": 36555.61,
+        "avg_chunk_time": 0.0146,
+        "median_chunk_time": 0.0144,
+        "errors": []
+      },
+      {
+        "test_name": "No Filter Query (chunk_size=1000)",
+        "total_time": 9.78,
+        "time_to_first_chunk": 4.18,
+        "total_measurements": 377209,
+        "total_chunks": 378,
+        "throughput": 38570.61,
+        "avg_chunk_time": 0.0147,
+        "median_chunk_time": 0.0146,
+        "errors": []
+      }
+    ],
+    "concurrent_clients": {
+      "1_clients": {
+        "num_clients": 1,
+        "results": [
+          {
+            "test_name": "Concurrent Query (Worker 1)",
+            "total_time": 7.995,
+            "time_to_first_chunk": 1.859,
+            "total_measurements": 421606,
+            "total_chunks": 422,
+            "throughput": 52735.11,
+            "avg_chunk_time": 0.0143,
+            "median_chunk_time": 0.0143,
+            "errors": []
+          }
+        ],
+        "total_measurements": 421606,
+        "avg_time": 7.994787216186523,
+        "total_time": 7.994787216186523
+      },
+      "2_clients": {
+        "num_clients": 2,
+        "results": [
+          {
+            "test_name": "Concurrent Query (Worker 1)",
+            "total_time": 9.469,
+            "time_to_first_chunk": 3.046,
+            "total_measurements": 421606,
+            "total_chunks": 422,
+            "throughput": 44522.92,
+            "avg_chunk_time": 0.015,
+            "median_chunk_time": 0.0145,
+            "errors": []
+          },
+          {
+            "test_name": "Concurrent Query (Worker 2)",
+            "total_time": 9.523,
+            "time_to_first_chunk": 2.925,
+            "total_measurements": 421606,
+            "total_chunks": 422,
+            "throughput": 44273.43,
+            "avg_chunk_time": 0.0153,
+            "median_chunk_time": 0.0144,
+            "errors": []
+          }
+        ],
+        "total_measurements": 843212,
+        "avg_time": 9.496095538139343,
+        "total_time": 9.52303695678711
+      },
+      "5_clients": {
+        "num_clients": 5,
+        "results": [
+          {
+            "test_name": "Concurrent Query (Worker 2)",
+            "total_time": 10.449,
+            "time_to_first_chunk": 3.029,
+            "total_measurements": 421606,
+            "total_chunks": 422,
+            "throughput": 40348.69,
+            "avg_chunk_time": 0.0174,
+            "median_chunk_time": 0.0149,
+            "errors": []
+          },
+          {
+            "test_name": "Concurrent Query (Worker 1)",
+            "total_time": 11.73,
+            "time_to_first_chunk": 4.283,
+            "total_measurements": 421606,
+            "total_chunks": 422,
+            "throughput": 35943.54,
+            "avg_chunk_time": 0.0175,
+            "median_chunk_time": 0.015,
+            "errors": []
+          },
+          {
+            "test_name": "Concurrent Query (Worker 5)",
+            "total_time": 12.684,
+            "time_to_first_chunk": 5.549,
+            "total_measurements": 421606,
+            "total_chunks": 422,
+            "throughput": 33237.93,
+            "avg_chunk_time": 0.0168,
+            "median_chunk_time": 0.0147,
+            "errors": []
+          },
+          {
+            "test_name": "Concurrent Query (Worker 3)",
+            "total_time": 12.806,
+            "time_to_first_chunk": 5.431,
+            "total_measurements": 421606,
+            "total_chunks": 422,
+            "throughput": 32923.45,
+            "avg_chunk_time": 0.0174,
+            "median_chunk_time": 0.0151,
+            "errors": []
+          },
+          {
+            "test_name": "Concurrent Query (Worker 4)",
+            "total_time": 12.868,
+            "time_to_first_chunk": 5.682,
+            "total_measurements": 421606,
+            "total_chunks": 422,
+            "throughput": 32764.44,
+            "avg_chunk_time": 0.0169,
+            "median_chunk_time": 0.0151,
+            "errors": []
+          }
+        ],
+        "total_measurements": 2108030,
+        "avg_time": 12.107331371307373,
+        "total_time": 12.869186162948608
+      }
+    }
+  }
+}

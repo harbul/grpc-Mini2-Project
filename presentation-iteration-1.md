@@ -122,7 +122,7 @@ auto channel = grpc::CreateCustomChannel(
 ```
 
 ### **Status:**
-⚠️ **NOT YET FIXED** - This needs to be implemented
+✅ **FIXED** - Implemented in all servers (gateway, team leaders)
 
 ---
 
@@ -135,8 +135,9 @@ auto channel = grpc::CreateCustomChannel(
 - Queries with small result sets: **Working** ✅ (26,269 measurements returned)
 - Queries with large result sets: **Still failing** ❌ (gRPC message size limit)
 
-### **Expected After Fixing Issue #2:**
+### **After Fixing Issue #2:**
 - All queries should work regardless of result size ✅
+- Performance testing in progress to verify
 
 ---
 
@@ -152,9 +153,9 @@ auto channel = grpc::CreateCustomChannel(
 ## 📝 **Next Steps**
 
 1. ✅ Fix filter combination logic (DONE)
-2. ⏳ Increase gRPC message size limits (TODO)
-3. ⏳ Re-test all query combinations
-4. ⏳ Verify performance with large result sets
+2. ✅ Increase gRPC message size limits (DONE)
+3. 🔄 Re-test all query combinations (IN PROGRESS)
+4. 🔄 Verify performance with large result sets (IN PROGRESS)
 
 ---
 

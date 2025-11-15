@@ -162,8 +162,12 @@ class FireQueryServiceImpl(fire_service_pb2_grpc.FireQueryServiceServicer):
             print(f"[{self.process_id}] Forwarding query to Team Leader {neighbor_id} at {neighbor_address}")
             
             try:
-                # Create channel to team leader
-                channel = grpc.insecure_channel(neighbor_address)
+                # Create channel to team leader with increased message size limits
+                options = [
+                    ('grpc.max_receive_message_length', 100 * 1024 * 1024),  # 100MB
+                    ('grpc.max_send_message_length', 100 * 1024 * 1024),     # 100MB
+                ]
+                channel = grpc.insecure_channel(neighbor_address, options=options)
                 stub = fire_service_pb2_grpc.FireQueryServiceStub(channel)
                 
                 # Forward the query
