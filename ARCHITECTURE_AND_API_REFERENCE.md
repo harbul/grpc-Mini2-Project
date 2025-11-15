@@ -72,6 +72,31 @@ Configuration JSON files under `configs/` wire process identity, ports, neighbor
 | `InternalQuery` | Process -> Process   | `InternalQueryRequest`   | `InternalQueryResponse` | Used by leaders to query workers; workers respond with aggregated measurements. |
 | `Notify`        | Process -> Process   | `InternalQueryRequest`   | `StatusResponse`        | Hook for async notifications (currently returns simple acknowledgment). |
 
+### API Execution Flow & Algorithms
+- **`Query` (client ➜ gateway)**: *Ingress*—client stubs stream a `QueryRequest` to Process A, which registers the `request_id` in `active_requests` with default status and timestamps. *Aggregation*—gateway forwards the filter to both team leaders via `InternalQuery`; leaders execute `_query_local_data` and call `forward_to_workers` so every worker runs the same filter across its partition-local `FireColumnModel`. *Chunking*—gateway concatenates leader payloads, derives chunk boundaries (`ceil(results / max_results_per_chunk)`), and streams `QueryResponseChunk` messages while `_update_chunks_sent` records progress and `_is_cancelled` plus `context.is_active()` guard against cancellations/disconnects. *Termination*—once chunks finish (or cancellation triggers an exit) the gateway invokes `_mark_completed`/`_mark_cancelled` and schedules `_cleanup_request` via `threading.Timer`.
+- **`CancelRequest` (client ➜ gateway)**: *Lookup*—gateway finds the tracking record under `request_lock`. *State flip*—it sets `cancelled=True` and updates `status="cancelled"`, preserving `chunks_sent/total_chunks`; unknown IDs yield `status="not_found"`. *Propagation*—the streaming loop checks `_is_cancelled` before each chunk, aborting promptly while leaving delivered chunks intact.
+- **`GetStatus` (client ➜ gateway)**: *Snapshot*—under lock the gateway retrieves `status`, `chunks_sent`, and `total_chunks` and returns them in `StatusResponse`. *Consistency*—because `_update_chunks_sent` runs after every emission, status polling sees monotonic progress; missing IDs respond with `status="not_found"` so clients detect expired handles.
+- **`InternalQuery` (process ➜ process)**: *Leader pathway*—leaders accept the call, run `_query_local_data` which unions parameter/site/agency indices, intersects numeric/date/geo bounds, and converts surviving indices into `FireMeasurement` protos. *Worker fan-out*—leaders invoke `forward_to_workers`, where each worker repeats the filtering in C++ and appends its measurements. *Response*—leaders set `responding_process`, append all measurements, mark `is_complete=True`, and return; workers follow the same algorithm without fan-out. *Gateway placeholder*—Process A currently returns an empty response but retains the hook for future caching.
+- **`Notify` (process ➜ process)**: Serves as a lightweight control-plane hook; every process logs the sender and replies with `status="acknowledged"`, keeping the RPC available for future health pings or cache invalidations.
+
+## API Deep Dive
+- **Query**
+    - `gateway/server.py`: Registers inbound `request_id`, logs metadata, and stores lifecycle fields (`status`, `chunks_sent`, timers) inside `active_requests` guarded by `request_lock`. The gateway invokes `forward_to_team_leaders`, waits for both responses, flattens the returned `FireMeasurement` protos, and chunks them using the requested `max_results_per_chunk`. During streaming, the gateway enforces cancellation (`_is_cancelled`), client liveness (`context.is_active()`), and updates telemetry counters (`_update_chunks_sent`). Workload: CPU spent on serialization and slicing; memory pressure determined by combined leader payload size (worst-case accumulates all measurements before chunking).
+    - `team_green/server_b.py` and `team_pink/server_e.py`: Leaders execute `_query_local_data`, which leverages the Python column store to assemble candidate indices, intersect numeric/date/geospatial constraints, and build `FireMeasurement` protos in-memory. They then run `forward_to_workers`, which issues synchronous `InternalQuery` calls to each neighbor, concatenating payloads and logging per-worker counts. No chunking occurs at this tier; leaders return the entire aggregated list to the gateway. Workload: dominated by filter evaluation and proto construction; latency proportional to worker RPC round-trips.
+    - C++ workers (`team_green/server_c.cpp`, `team_pink/server_d.cpp`, `team_pink/server_f.cpp`): `InternalQuery` handler reads the generated `InternalQueryRequest`, performs lookups against unordered_map indices, filters via loops over vectorized columns, and uses generated setters (e.g., `measurement->set_site_name(...)`) to populate responses. Because workers serve a single partition, they do not forward further. Workload: compute-bound filtering plus message serialization; memory reuse through vector storage reduces allocations.
+- **CancelRequest**
+    - `gateway/server.py`: Only component with actionable cancellation. It acquires `request_lock`, flips `cancelled` and `status`, and reports the latest `chunks_sent`/`total_chunks`. The streaming loop checks `_is_cancelled` prior to yielding each chunk, ensuring minimum extra work after cancellation. Workload: trivial (dictionary mutation + log statements) but critical for responsiveness; designed to be O(1) per call.
+    - Leaders/workers: Stubs return canned acknowledgements. Future enhancements could propagate cancellation downstream by interrupting ongoing worker RPCs or bypassing local filtering.
+- **GetStatus**
+    - `gateway/server.py`: Reads `active_requests` under lock, returning a snapshot of progress fields. Accuracy depends on the streaming path calling `_update_chunks_sent` right after each chunk send. Workload: O(1) lookups; scales with number of concurrent tracked requests.
+    - Leaders/workers: Return static responses (`status="untracked"` or similar), signaling readiness to implement richer reporting later without violating proto contracts.
+- **InternalQuery**
+    - `gateway/server.py`: Currently a placeholder returning an empty response; serves as hook for potential gateway-side caching or loopback queries when Process A hosts data.
+    - Leaders: Translate the filter, perform local aggregation, then iterate over workers. They set `responding_process`, `is_complete`, and attach every measurement gathered. Leaders effectively serve as reducers in a map-reduce pattern, shouldering the workload of combining multiple worker payloads.
+    - Workers: Pure filter engines. They do not maintain per-request state beyond the call stack, enabling high concurrency via gRPC thread pools. Returning full batches keeps logic simple but requires the gateway to manage chunking.
+- **Notify**
+    - All processes: Log the notification (useful for debugging) and return `status="acknowledged"`. With no additional logic, the workload is negligible. The RPC is intentionally lightweight so future adoption (e.g., cache invalidations, health heartbeats, or back-pressure signals) can reuse the channel without interface changes.
+
 ### Message Schemas
 - `QueryRequest`: includes `request_id`, `QueryFilter`, `query_type` strings, chunk preferences.
 - `QueryFilter`: supports site, agency, parameter lists; bounding boxes; time ranges; concentration/AQI thresholds.
@@ -90,120 +115,184 @@ Configuration JSON files under `configs/` wire process identity, ports, neighbor
     - C++: `proto/fire_service.pb.h/cc` and `proto/fire_service.grpc.pb.h/cc` (headers/sources compiled into each binary).
 - When regenerating stubs, ensure both Python and C++ artifacts are refreshed; stale bindings produce runtime incompatibilities, especially if field numbers change.
 
+### proto/fire_service_pb2.py and fire_service_pb2_grpc.py (Generated Python Bindings)
+- `fire_service_pb2.py`: Auto-generated dataclasses for every message in the proto. Encodes/decodes protobuf wire format, exposes typed accessors (e.g., `QueryRequest.filter`) and helper constructors. No business logic—treat as serialization backbone accessed by all Python services and clients.
+- `fire_service_pb2_grpc.py`: Supplies base service classes (`FireQueryServiceServicer`) and client stubs (`FireQueryServiceStub`). Gateway/leaders inherit from the servicer to implement RPC bodies; clients instantiate the stub to invoke RPCs. Includes registration helpers (`add_FireQueryServiceServicer_to_server`). Regenerated alongside `fire_service_pb2.py`.
+
+### proto/fire_service.pb.h/.cc and fire_service.grpc.pb.h/.cc (Generated C++ Bindings)
+- `fire_service.pb.h/.cc`: Provide C++ message classes, getters/setters, serialization methods, and type registration. C++ workers and client link against these to build `QueryRequest`, `FireMeasurement`, etc.
+- `fire_service.grpc.pb.h/.cc`: Define the C++ service interface (`FireQueryService::Service`) and client stub (`FireQueryService::Stub`). Workers derive from the service to implement RPC handlers; the C++ client uses the stub to issue synchronous calls. Rebuild via CMake after proto changes to keep signatures aligned.
+
+### proto/__init__.py
+- Declares the `proto` directory as a Python package and optionally re-exports generated modules. Keeps `import proto.fire_service_pb2` working across the repo. Update exports if new protos are added.
+
 ### gateway/server.py (Process A Gateway)
 **Class `FireQueryServiceImpl`**
-- `__init__(config)`: reads runtime metadata (identity, neighbors) and seeds `active_requests` with a thread lock for request lifecycle tracking.
-- `Query(request, context)`: orchestrates the entire query lifecycle.
-    1. Validates/records the incoming `request_id` in `active_requests` with default status `processing` and `chunks_sent=0`.
-    2. Calls `forward_to_team_leaders` to gather full result sets from Teams Green and Pink.
-    3. Computes chunk boundaries (defaults to 1000 results when `max_results_per_chunk` is unset) and updates `total_chunks` in the tracking map.
-    4. Streams each `QueryResponseChunk`, checking `_is_cancelled` and `context.is_active()` before transmission, sleeping briefly (`0.01s`) to simulate progressive delivery.
-    5. On completion, invokes `_mark_completed`; on exception, `_mark_failed`; in both cases schedules `_cleanup_request` via `threading.Timer`.
-- `forward_to_team_leaders(request)`: iterates neighbor list (B and E), opens gRPC channels with enlarged message limits, issues `InternalQuery` RPCs, and aggregates `FireMeasurement` payloads.
-- `CancelRequest(request, context)`: marks matching `request_id` as cancelled, echoes chunk progress in a `StatusResponse`.
-- `GetStatus(request, context)`: reports current state (`processing`, `completed`, etc.) plus chunk counters for an ongoing or completed request.
-- `InternalQuery(request, context)`: placeholder for potential use if gateway also held data; currently returns empty completion response.
-- `Notify(request, context)`: acknowledges control notifications, useful for future coordination signals.
-- `_is_cancelled(request_id)`: reads cancellation flag under lock to decide whether to stop streaming.
-- `_mark_cancelled(request_id)`: flips status and cancellation flag post client request or disconnect.
-- `_mark_completed(request_id)`: finalizes request status when streaming finishes.
-- `_mark_failed(request_id)`: records failure state for error reporting back to clients.
-- `_update_chunks_sent(request_id, chunks_sent)`: increments chunk counter so status checks show progress.
-- `_cleanup_request(request_id)`: timer-triggered removal to prune finished requests from memory after 60 seconds.
+- `__init__(config)`: Flow—loads JSON config, extracts identity/role/neighbor list, and initializes `active_requests` (dict) plus `request_lock` (threading.Lock). Algorithm—store per-request lifecycle template (`status='idle'`, counters zeroed) and pre-log topology to aid debugging. Structures—`active_requests` maps `request_id -> {status, start_time, chunks_sent, total_chunks, cancelled}`.
+- `Query(request, context)`: Flow—register request, fetch measurements, stream chunks, tear down state. Algorithm—(1) create tracking entry; (2) call `forward_to_team_leaders` to collect all measurements, catching exceptions and early-cancels; (3) compute `max_per_chunk` with safe default, derive `total_chunks` via ceiling division; (4) in a for-loop per chunk: check `_is_cancelled`, ensure `context.is_active()`, slice measurement list, build `QueryResponseChunk`, send via `yield`, call `_update_chunks_sent`, sleep 10 ms to showcase chunking; (5) mark success/failure and spawn timer for cleanup. Structures—relies on Python lists for aggregated measurements and repeated protobuf fields for chunk payloads.
+- `forward_to_team_leaders(request)`: Flow—iterate neighbors, dial gRPC channel, send `InternalQuery`, collect responses. Algorithm—build `InternalQueryRequest` mirroring client filter, set 100 MB gRPC limits, call `stub.InternalQuery`, extend `all_measurements` with returned list, log counts, close channel, swallow `grpc.RpcError` after logging to maintain partial progress. Structures—uses neighbor descriptors (`hostname`, `port`, `process_id`) from config.
+- `CancelRequest(request, context)`: Flow—lookup tracking entry under lock, toggle cancellation, respond with metrics. Algorithm—set `cancelled=True`, `status='cancelled'`, preserve `chunks_sent`/`total_chunks` for client telemetry; if missing, respond `status='not_found'`. Structures—mutates same dict entry used by `Query` and `GetStatus`.
+- `GetStatus(request, context)`: Flow—read tracking entry and surface progress. Algorithm—under lock, fetch `status`, `chunks_sent`, `total_chunks`; default to `not_found` when entry absent (e.g., already cleaned). Structures—read-only access to `active_requests` snapshot.
+- `InternalQuery(request, context)`: Flow—log caller and respond immediately. Algorithm—construct empty `InternalQueryResponse`, copy IDs, set `responding_process=self.process_id`, `is_complete=True`; intended to be fleshed out when Process A owns data. Structures—no local data scanned today.
+- `Notify(request, context)`: Flow—log sender, return acknowledgement. Algorithm—build `StatusResponse(status='acknowledged')`; lightweight placeholder for future orchestration signals.
+- `_is_cancelled(request_id)`: Flow—look up flag under lock and return boolean. Algorithm—ensures streaming loop exits quickly without mutating state; returns False if request missing (already cleaned/completed).
+- `_mark_cancelled`, `_mark_completed`, `_mark_failed`: Flow—update `status` field safely. Algorithm—each helper checks entry existence before mutating; called from streaming/cancellation paths to keep status consistent for `GetStatus`.
+- `_update_chunks_sent(request_id, chunks_sent)`: Flow—store last emitted chunk index. Algorithm—single dictionary assignment under lock so status polling reflects progress even mid-stream.
+- `_cleanup_request(request_id)`: Flow—scheduled via `threading.Timer(60s)` to evict completed/cancelled entries. Algorithm—under lock, delete dict key if still present; logs cleanup action to aid tracing.
 
 **Module-level helpers**
-- `load_config(config_path)`: loads JSON configuration for the process.
-- `serve(config_path)`: creates a thread pool gRPC server, registers `FireQueryServiceImpl`, binds to configured host:port, and blocks on `wait_for_termination`.
-- `main`: parses CLI arguments and dispatches to `serve`.
+- `load_config(config_path)`: Flow—open file, `json.load`, return dict. Algorithm—raises on IO/parse error, letting caller fail fast; centralizes config parsing for reuse in tests.
+- `serve(config_path)`: Flow—load config, instantiate service, create `grpc.server` with `ThreadPoolExecutor(max_workers=10)`, register servicer, bind to host:port, start, block on `wait_for_termination`. Algorithm—ensures service lifetime managed via gRPC server object; logs startup metadata. Structures—uses generated registration helper.
+- `main`: Flow—validate CLI args, call `serve`, handle usage errors. Algorithm—expects exactly one argument (config path); prints usage and exits non-zero otherwise.
 - Runtime environment: uses `grpc.server(futures.ThreadPoolExecutor(max_workers=10))`, so each incoming RPC runs on its own thread—hence the need for `request_lock` when touching `active_requests`.
 
 ### team_green/server_b.py (Process B Leader)
 **Class `FireQueryServiceImpl`**
-- `__init__(config)`: logs topology details, instantiates Python `FireColumnModel`, optionally loading only whitelisted directories from `data_partition`; prints measurement counts to confirm data coverage.
-- `Query(request, context)`: safety handler for direct client access; returns empty result chunk while keeping server compliant with service definition.
-- `InternalQuery(request, context)`: main entry point for Process A; retrieves local matches via `_query_local_data`, forwards residual work to neighbors (Process C), aggregates responses, and constructs `InternalQueryResponse`.
-- `_query_local_data(request)`: applies parameter OR filtering, site-based lookup, and AQI range AND filtering against the Python column model; converts indices into `FireMeasurement` messages.
-- `forward_to_workers(request)`: loops over neighbors (C), making `InternalQuery` calls and concatenating results.
-- `CancelRequest(request, context)`, `GetStatus(request, context)`, `Notify(request, context)`: placeholder implementations returning canned responses for possible future use.
+- `__init__(config)`
+    - Flow—log identity, neighbors, and partition settings; instantiate `FireColumnModel`; call `read_from_directory` with `config['data_partition']['directories']` (if enabled); emit local measurement counts so the gateway can anticipate load.
+    - Algorithm—builds a neighbor cache directly from config (no network discovery) and reuses the shared column model ingestion pipeline.
+    - Work—single-shot boot action; failure to locate data still results in a serving process but with empty results.
+- `Query(request, context)`
+    - Flow—acts as a defensive RPC when a client bypasses the gateway; yields one `QueryResponseChunk` with zero results and `is_last_chunk=True`.
+    - Algorithm—no filtering; returns immediately while still speaking the streaming API the proto requires.
+    - Work—constant time regardless of dataset size.
+- `InternalQuery(request, context)`
+    - Flow—gateway fan-out entry point; logs request metadata, calls `_query_local_data` to cover Process B’s partition, then invokes `forward_to_workers` to fan the query to C (and any future neighbors) before combining all measurements into a single `InternalQueryResponse`.
+    - Algorithm—performs sequential aggregation: local evaluation, remote fetch loop, metadata population (`responding_process`, `is_complete=True`).
+    - Work—dominant cost is the column scan plus network time; response size scales with total matches.
+- `_query_local_data(request)`
+    - Flow—interprets the `QueryFilter`: seed with union of parameter/site hits (OR semantics), then narrow using AQI thresholds (AND semantics). When no filter is provided it returns the entire partition.
+    - Algorithm—leverages column-model inverted indexes for parameter/site lookup, then iterates candidate indices to enforce numeric predicates before materializing `FireMeasurement` protos.
+    - Work—bounded by candidate count; uses Python list iteration but avoids duplicate conversions by set union.
+- `forward_to_workers(request)`
+    - Flow—walks neighbor list from config (currently C), constructs gRPC channels with 100 MB send/receive caps, calls each worker’s `InternalQuery`, concatenates returned measurements, and closes the channel.
+    - Algorithm—serial RPC loop with best-effort error handling (logs failures, continues to next neighbor).
+    - Work—O(number of neighbors) network round-trips plus proto merges; no threading.
+- `CancelRequest`, `GetStatus`, `Notify`
+    - Flow—surface-level control plane hooks that respond with canned `StatusResponse` objects; they keep the proto contract even though Process B does not yet track per-request state.
+    - Algorithm—straight-line construction of acknowledgements.
+    - Work—constant time handlers suitable for future extension.
 
-**Module-level helpers**
-- `load_config(config_path)`: JSON loader mirroring gateway.
-- `serve(config_path)`: spins up gRPC server for Process B using `ThreadPoolExecutor`.
-- `main`: command-line interface.
-- When forwarding to workers, gRPC channels are created with `grpc.max_receive_message_length` and `grpc.max_send_message_length` set to 100 MB—mirrored in the gateway—to accommodate large measurement batches.
+**Module helpers**
+- `load_config(config_path)` is a straightforward JSON loader mirroring the gateway utility.
+- `serve(config_path)` boots a `ThreadPoolExecutor` gRPC server, registers `FireQueryServiceImpl`, binds to the configured address, and blocks on `wait_for_termination` while printing lifecycle hints.
+- `main` validates CLI arguments and delegates to `serve`.
+- gRPC client channels consistently set `grpc.max_receive_message_length` and `grpc.max_send_message_length` to 100 MB so large measurement batches never truncate mid-flight.
 
 ### team_pink/server_e.py (Process E Leader)
-Mirror of Process B with pink-specific partitions.
-- `__init__`: loads partitions for Sep 5-13 and neighbors D/F.
-- `Query`: fallback empty chunk for unexpected client calls.
-- `InternalQuery`: queries local `FireColumnModel`, forwards to D and F, aggregates all measurements, and responds to gateway.
-- `_query_local_data`: identical filtering flow as Process B, operating on pink partition.
-- `forward_to_workers`: fans out to D and F through gRPC.
-- `CancelRequest`, `GetStatus`, `Notify`: stub responses.
-- `load_config`, `serve`, `main`: same patterns as other Python servers.
-- Uses the same 100 MB gRPC message limits as Process B to prevent truncation when aggregating Team Pink data.
+Python twin of Process B adapted for the pink partition.
+- `__init__(config)`
+    - Flow—load Sep 5–13 directories into `FireColumnModel`, capture neighbor metadata (shared worker D, exclusive worker F), and print dataset inventory for observability.
+    - Algorithm—identical ingestion path to Process B but isolates a different whitelist of directories.
+    - Work—startup cost proportional to pink data volume.
+- `Query` mirrors the defensive behavior of Process B, yielding an empty chunk when invoked directly.
+- `InternalQuery`
+    - Flow—perform `_query_local_data`, then branch to `forward_to_workers` which iterates over both neighbors; combines local + D + F results and marks response metadata.
+    - Algorithm—same sequential aggregation pattern as Process B but with two remote hops.
+    - Work—scales with pink partition size plus results from both workers.
+- `_query_local_data` interprets filters identically to Process B but operates on pink data files.
+- `forward_to_workers`
+    - Flow—handles neighbor list in config order (D then F), creates oversized gRPC channels, invokes each `InternalQuery`, merges results, and logs per-neighbor counts while allowing subsequent neighbors to proceed even after individual RPC failures.
+    - Algorithm—serial RPC loop with try/except around each call.
+    - Work—O(number of neighbors) RPC effort; duplicates suppressed earlier by relying on underlying worker partitions.
+- `CancelRequest`, `GetStatus`, `Notify`, `load_config`, `serve`, `main`, and the 100 MB gRPC option policy are all equivalent to Process B.
 
 ### team_green/server_c.cpp (Process C Worker)
 **Class `FireQueryServiceImpl`**
-- Constructor: parses JSON config, logs identity, loads allowed directories into C++ `FireColumnModel` to back queries.
-- `Status Query(...)`: handles direct client calls with an empty chunk to remain protocol compliant.
-- `Status InternalQuery(...)`: receives filters from Process B, performs parameter OR, site lookup, and AQI range filtering using C++ model getters, fills `InternalQueryResponse` with matching rows, and marks response complete.
-- `Status CancelRequest(...)`: returns a `StatusResponse` indicating cancellation acknowledgement for monitoring hooks.
-- `Status GetStatus(...)`: echoes a pending status for diagnostics.
-- `Status Notify(...)`: acknowledges notifications from leaders.
+- Constructor
+    - Flow—parse JSON config, record identity/role/team, build list of allowed subdirectories, and call `FireColumnModel::readFromDirectory` to load the worker’s partition.
+    - Algorithm—relies on `nlohmann::json` accessors and the C++ column model ingestion path; emits measurement counts for confirmation.
+    - Work—startup-only cost dominated by CSV ingestion.
+- `Status Query(...)`
+    - Flow—acts as a defensive stub when a client calls a worker directly; streams one empty `QueryResponseChunk` via `ServerWriter`.
+    - Algorithm—populate chunk fields with zeros and `is_last_chunk=true`, return `Status::OK`.
+    - Work—constant time regardless of dataset.
+- `Status InternalQuery(...)`
+    - Flow—log request metadata, build candidate indices using parameter/site OR semantics, narrow with AQI bounds, then append each matching row to `InternalQueryResponse::add_measurements`; set request/response identifiers and mark `is_complete=true`.
+    - Algorithm—uses `std::set` to deduplicate parameter lookups, vector iteration for AQI filters, and direct column accessors to populate protos.
+    - Work—bounded by number of candidate indices; avoids duplicate allocations by reserving inside the protobuf repeated field.
+- `Status CancelRequest(...)`, `Status GetStatus(...)`, `Status Notify(...)`
+    - Flow—emit canned `StatusResponse` acknowledgements to preserve API coverage.
+    - Algorithm—straight-line assignments; Notify simply logs sender identity before acknowledging.
+    - Work—constant-time guardrails for future lifecycle tracking.
 
 **Supporting functions**
-- `load_config(config_path)`: reads JSON config via `nlohmann::json`.
-- `RunServer(config_path)`: builds gRPC server, registers service, prints status, and blocks until shutdown.
-- `main`: CLI entrypoint verifying arguments and running server.
+- `load_config` wraps `std::ifstream` + `nlohmann::json` parsing, throwing on missing files to fail fast.
+- `RunServer` constructs `FireQueryServiceImpl`, registers it with `ServerBuilder`, binds to the configured host:port, and blocks on `server->Wait()` while printing startup hints.
+- `main` handles CLI validation and prints runtime errors before exiting non-zero.
 
 ### team_pink/server_d.cpp (Process D Worker)
-Functionality mirrors Process C while serving a different partition and accepting `InternalQuery` from both leaders B and E. Each method implements the same logic paths with shared C++ model accessors.
+Shared C++ worker consumed by both teams.
+- Constructor loads the Aug 27–Sep 4 slice into `FireColumnModel`, remembers both Process B and Process E as neighbors (for logging), and reports readiness.
+- `InternalQuery`
+    - Flow—identical to Process C’s filtering pipeline; populates `responding_process="D"` so leaders can attribute results when aggregating shared data.
+    - Algorithm—delegates to the same column-model helpers; agnostic to the caller.
+    - Work—scales with the shared partition size.
+- `Query`, `CancelRequest`, `GetStatus`, `Notify` replicate Process C’s defensive stubs to keep the gRPC surface uniform.
+- `RunServer`, `load_config`, `main` reuse the same wiring; only default config paths differ.
 
 ### team_pink/server_f.cpp (Process F Worker)
-Identical structure to Process C and D but serving Sep 14-24 data partition exclusively for Team Pink leader E.
+Exclusive C++ worker for Process E.
+- Constructor loads Sep 14–24 directories and records that only Process E is a neighbor, enabling minimal logging while still printing measurement inventory.
+- `InternalQuery`
+    - Flow—same filtering stages as Processes C/D but returns `responding_process="F"` to keep leader attribution accurate.
+    - Algorithm—reuses column-model accessors; no special casing beyond metadata.
+    - Work—bounded by F’s data partition size.
+- Remaining RPCs (`Query`, `CancelRequest`, `GetStatus`, `Notify`) mirror Process C’s guards, ensuring API parity.
+- Support functions (`load_config`, `RunServer`, `main`) stay copy-equivalent aside from config defaults, delivering operational parity across workers.
 
 ### common/fire_column_model.py (Python Column Model)
 **Class `FireColumnModel`**
-- `__init__`: initializes column arrays, dictionaries for quick lookup, metadata sets, datetime bounds, and geographic bounds.
-- `read_from_directory(directory_path, allowed_subdirs=None)`: walks directory tree, filtering optional partitions, assembles CSV file list, and delegates to `read_from_csv`, logging successes.
-- `read_from_csv(filename)`: parses each CSV row without headers, converts to typed values, and calls `insert_measurement`; skips malformed rows.
-- `insert_measurement(...)`: appends values into column lists, updates lookup indices, metadata (unique sets), geospatial bounds, and datetime range. This function is the *only* mutation entry point—every query relies on the invariants maintained here (`_site_indices`, `_parameter_indices`, `_aqs_indices` all remain synchronized with column vectors).
-- `get_indices_by_site(site_name)`, `get_indices_by_parameter(parameter)`, `get_indices_by_aqs_code(aqs_code)`: expose fast lookups using pre-built dictionaries.
-- `measurement_count()`, `site_count()`, `unique_sites()`, `unique_parameters()`, `unique_agencies()`, `datetime_range()`, `geographic_bounds()`: report summary statistics.
-- `_update_indices(index)`: internal helper to populate lookup dictionaries with new index.
-- `_update_geographic_bounds(latitude, longitude)`: grows min/max geospatial bounds as data loads.
-- `_update_datetime_range(datetime)`: tracks earliest and latest timestamp strings.
-- `_get_csv_files(...)`: returns sorted list of CSV paths respecting partition whitelist and handling errors gracefully.
+- `__init__`: Flow—set up empty Python lists for every measurement column (site, parameter, concentration, longitude, etc.), initialize lookup dicts mapping keys to list of row indices, and seed metadata (min/max lat/lon, datetime bounds) with sentinel state. Algorithm—ensures every column stays position-aligned (index `i` across all lists represents one measurement). Structures—lists for each attribute plus dicts keyed by `site_name`, `parameter`, `aqs_code`, `agency`, enabling O(1) index lookups.
+- `read_from_directory(directory_path, allowed_subdirs=None)`: Flow—invoke `_get_csv_files` to enumerate CSVs (respecting optional whitelist), iterate files, call `read_from_csv` for each, accumulate counts. Algorithm—wraps IO errors per file to keep ingestion resilient; returns aggregate inserted row count for logging. Structures—delegates file discovery to `_get_csv_files` which returns deterministic sorted list.
+- `read_from_csv(filename)`: Flow—open CSV, skip header, for each row parse into typed fields, call `insert_measurement`; count successes/failures. Algorithm—casts numeric fields (`float`, `int`) with fallback, normalizes strings (strip whitespace), and guards against malformed rows using try/except. Structures—local tuple representing measurement passed to `insert_measurement`.
+- `insert_measurement(...)`: Flow—append column values to parallel lists, update lookup dicts, recompute metadata. Algorithm—push value into each list, call `_update_indices` to maintain inverted indexes, `_update_geographic_bounds` for lat/lon, `_update_datetime_range` for time, update `unique_*` sets. Structures—`self.index` increments sequentially, ensuring consistent row IDs returned to query evaluators.
+- `get_indices_by_site(site_name)`, `get_indices_by_parameter(parameter)`, `get_indices_by_aqs_code(aqs_code)`: Flow—retrieve list of row indices for the key or empty list. Algorithm—dict lookups with `.get(key, [])` to avoid KeyError; supports OR semantics by concatenating results. Structures—lists are stored as direct references so no copying occurs unless caller modifies them.
+- `measurement_count()`, `site_count()`, `unique_sites()`, `unique_parameters()`, `unique_agencies()`, `datetime_range()`, `geographic_bounds()`: Flow—return snapshot metrics derived from cached fields. Algorithm—constant-time operations; no recomputation. Structures—`datetime_range` returns tuple `(min_datetime, max_datetime)`, geospatial bounds return dictionary or tuple (depending on implementation) reflecting latest min/max.
+- `_update_indices(index)`: Flow—append newly inserted index to all relevant lookup dicts (`site`, `parameter`, `aqs`, `agency`). Algorithm—`dict.setdefault(key, []).append(index)` pattern ensures creation on first occurrence. Structures—keeps inverted indexes in sync with column vectors.
+- `_update_geographic_bounds(latitude, longitude)`: Flow—compare new coordinate against stored min/max floats, expand bounds when necessary. Algorithm—handles first insert by assigning values when sentinel `None` present; subsequent inserts cast to float for comparisons. Structures—stores bounds as `[min_lat, max_lat, min_lon, max_lon]` (exact format as in code).
+- `_update_datetime_range(datetime)`: Flow—update earliest/latest timestamp strings using lexical comparisons (ISO 8601 ensures lexical order equals chronological order). Algorithm—if stored min/max are `None` or new value < min / > max, assign accordingly.
+- `_get_csv_files(...)`: Flow—walk directory tree (using `os.walk`), optionally filter by `allowed_subdirs`, collect `*.csv`, sort stable order, return list. Algorithm—logs missing directories/warnings, filters hidden files if needed, ensures deterministic ingestion order for reproducibility.
 
 ### common/FireColumnModel.cpp and FireColumnModel.hpp (C++ Column Model)
-- Constructor/Destructor: initialize bounds and metadata containers.
-- `readFromDirectory(directoryPath, allowedSubdirs)`: enumerates CSVs via `getCSVFiles`, invokes `readFromCSV` per file, and logs totals.
-- `readFromCSV(filename)`: uses `CSVReader` for safe parsing, skips headers, converts strings to typed values, and feeds `insertMeasurement`.
-- `insertMeasurement(...)`: appends to column vectors, calls `updateIndices`, `updateGeographicBounds`, `updateDatetimeRange`, and updates metadata sets. As in Python, this centralizes state mutation, ensuring indexes remain aligned.
-- `getIndicesBySite`, `getIndicesByParameter`, `getIndicesByAqsCode`: fetch index vectors from maps to serve worker filters.
-- `getGeographicBounds`: copies stored min/max values if initialized.
-- Private helpers `updateIndices`, `updateGeographicBounds`, `updateDatetimeRange`, `getCSVFiles`: maintain internal structures and enforce partition filtering with `<filesystem>`.
+- Constructor/Destructor: Flow—allocate vectors (`sites_`, `parameters_`, `aqi_`, etc.), `std::unordered_map` indexes for site/parameter/AQS, and metadata containers (min/max lat/lon). Algorithm—sets sentinel flags (e.g., `boundsInitialized_ = false`) to guard future updates; destructor relies on RAII for container cleanup.
+- `readFromDirectory(const std::string& directoryPath, const std::vector<std::string>& allowedSubdirs)`: Flow—call `getCSVFiles` to enumerate allowed CSV paths, iterate list, call `readFromCSV` for each, track total inserted rows. Algorithm—short-circuits on missing directory by returning 0 and logging; ensures deterministic processing order by sorting paths inside `getCSVFiles`.
+- `readFromCSV(const std::string& filename)`: Flow—instantiate `CSVReader`, open file, consume rows until EOF, transform each row into typed fields (dates, floats, ints), call `insertMeasurement`. Algorithm—skips header line, uses helper conversions (`parseLongOrZero`) to tolerate malformed numbers, wraps per-row parse in try/catch to continue on errors.
+- `insertMeasurement(...)`: Flow—append every value to associated `std::vector`, update inverted indexes via `updateIndices`, refresh metadata using `updateGeographicBounds`/`updateDatetimeRange`, and increment aggregate counters. Algorithm—keeps all vectors the same length to maintain positional indexing; uses emplace_back for minimal copies.
+- `getIndicesBySite`, `getIndicesByParameter`, `getIndicesByAqsCode`: Flow—return const reference to vector of indices for given key or static empty vector when key absent. Algorithm—avoids allocations by returning `static const std::vector<int64_t> empty;` reference; callers treat as read-only to preserve integrity.
+- `getGeographicBounds(double& minLat, double& maxLat, double& minLon, double& maxLon)`: Flow—if bounds initialized, copy stored doubles into out params and return `true`; otherwise leave params untouched and return `false`. Algorithm—supports worker RPC path that needs to guard usage when dataset empty.
+- `getDatetimeRange(std::string& minTs, std::string& maxTs)`: (if present) Flow—similar to geographic bounds; copies ISO strings into output arguments.
+- `updateIndices`, `updateGeographicBounds`, `updateDatetimeRange`, `getCSVFiles`: Flow—internal helpers called from ingestion. Algorithm—`updateIndices` pushes new row index into all relevant unordered_map vectors; `updateGeographicBounds` toggles `boundsInitialized_` and adjusts min/max; `updateDatetimeRange` compares lexicographically; `getCSVFiles` recurses directories using `std::filesystem::recursive_directory_iterator`, filters by whitelist, collects `.csv`, sorts for deterministic order.
 
 ### common/utils.hpp / utils.cpp
-- `parseLongOrZero(s)`: wraps `std::stoll`, returning 0 on failure for resilient parsing.
-- `timeCall(f)`: measures microseconds taken by invoking function `f` using `high_resolution_clock`.
-- `timeCallMulti(f, runs)`: repeats `f` and records runtime per invocation.
-- `mean(v)`: computes average of a vector of doubles.
+- `parseLongOrZero(const std::string& s)`: Flow—attempt to convert string to `long long` using `std::stoll`, catch `std::invalid_argument`/`std::out_of_range`, and return 0 on failure. Algorithm—supports tolerant parsing during CSV ingestion; avoids throwing exceptions outward.
+- `timeCall(std::function<void()> f)`: Flow—capture `start = high_resolution_clock::now()`, execute `f()`, capture end time, return duration in microseconds. Algorithm—provides lightweight instrumentation for worker hot paths without external dependencies.
+- `timeCallMulti(std::function<void()> f, int runs)`: Flow—loop `runs` times, call `timeCall(f)` each iteration, push result into vector, return vector. Algorithm—enables callers to compute aggregates (mean, std dev) for benchmarking; gracefully handles `runs <= 0` by returning empty vector.
+- `mean(const std::vector<double>& v)`: Flow—sum elements using `std::accumulate`, divide by `v.size()` when non-zero. Algorithm—returns 0.0 when vector empty to sidestep divide-by-zero; used in performance reporting.
 
 ### common/readcsv.hpp / readcsv.cpp
-- `CSVReader::CSVReader(path, delimiter, quote, comment)`: constructs reader with configurable delimiters.
-- `open()`: opens underlying `ifstream`, throwing on failure.
-- `close()`: closes file if open.
-- `readRow(out)`: reads logical CSV records (honoring quotes and comments) and splits them into fields.
-- Internal helpers `readPhysicalRecord` and `splitRecord`: manage multi-line quoted records and delimiter-aware parsing.
+ `CSVReader::CSVReader(path, delimiter, quote, comment)`: Flow—store file path, delimiter characters, quote character, and optional comment prefix; initialize internal buffers. Algorithm—supports configurable CSV dialects; defaults match dataset format.
+ `open()`: Flow—attempt to open `std::ifstream` with `std::ios::in`, throw descriptive `std::runtime_error` if open fails. Algorithm—called per file before streaming rows; ensures exceptions caught by caller.
+ `close()`: Flow—check `ifstream::is_open`, close if true. Algorithm—allows deterministic resource cleanup.
+ `readRow(std::vector<std::string>& out)`: Flow—clear `out`, call `readPhysicalRecord` to assemble a full logical line (merging multi-line quoted text), then `splitRecord` to tokenize fields respecting quotes and comment markers; return `false` on EOF. Algorithm—handles escaped delimiters inside quotes, strips trailing carriage returns, skips comment-only lines by recursing until a data row is found.
+ `readPhysicalRecord` and `splitRecord`: Flow—`readPhysicalRecord` appends lines until balanced quote counts achieved; `splitRecord` iterates characters, tracking quote state, building current field, and pushing to `out` when delimiter or end-of-line encountered. Algorithm—ensures multi-line values and embedded delimiters are parsed correctly—a necessity for the provided EPA datasets.
 
 ### client/test_client.py
-- `test_query(stub)`: crafts sample filter, issues `Query`, renders chunk progress bar, and prints sample measurements.
-- `test_get_status(stub)`: sends `GetStatus` RPC to gateway and prints stats.
-- `test_cancel_request(stub)`: exercises `CancelRequest` to validate control path.
-- `main()`: establishes gRPC channel to gateway, instantiates stub, and sequentially runs test trio.
+- `test_query(stub)`: Flow—assemble `QueryRequest` with PM2.5 filter, invoke `stub.Query`, iterate generator, print chunk metadata. Algorithm—counts records per chunk, samples first measurement to validate schema, catches `grpc.RpcError` for diagnostics. Structures—uses deterministic `request_id` to match later status calls.
+- `test_get_status(stub)`: Flow—reuse `request_id`, send `StatusRequest(action='status')`, print returned `status`, `chunks_delivered`, `total_chunks`. Algorithm—demonstrates expectation that gateway computes chunk totals lazily; handles missing request by reporting `not_found`.
+- `test_cancel_request(stub)`: Flow—issue `CancelRequest` via `StatusRequest(action='cancel')`, print status. Algorithm—intended to be run while `test_query` in progress; shows cancellation acknowledgment path even if request already complete.
+- `main()`: Flow—open insecure channel to `localhost:50051`, instantiate `FireQueryServiceStub`, sequentially call `test_query`, `test_get_status`, `test_cancel_request`. Algorithm—wraps in `try/except grpc.RpcError` to surface connection failures; demonstrates proper channel cleanup via `channel.close()` on exit.
 - Demonstrates idiomatic Python gRPC client usage (channel creation, stub instantiation, consuming streaming responses); treat it as the minimal reproducible example when onboarding new developers.
+
+### client/README_CPP_CLIENT.md
+- Step-by-step instructions for configuring a C++ build environment, running `cmake`/`make`, and executing the compiled client example. Serves as the companion document for developers extending the native client.
+
+### configs/process_a.json … process_f.json (Single-Computer Topology)
+- Structure: Each JSON describes a process with keys `identity`, `role`, `team`, `hostname`, `port`, `neighbors` (array of `{process_id, hostname, port}`), and `data_partition` specifying directories to load. Flow—process loads config at startup via `load_config`, binds to declared host:port, and records neighbor endpoints for RPC fan-out. Algorithm—data partitions enforce disjoint directory ownership (e.g., B: `20200810-20200817`, C: `20200818-20200826`). Gateway (`process_a.json`) omits `data_partition` because it holds no data.
+- Usage: Update hostnames/ports when deploying across machines, keeping neighbor IDs consistent. Workers/leaders rely on identical structure, allowing homogeneous loader functions (Python & C++).
+
+### configs/multi_computer/*.json (Deployment Templates)
+- `two_computer_template.json` / `three_computer_template.json`: Provide example mappings of processes to physical hosts with placeholder hostnames (`MACHINE_1`, etc.) and port allocations. Flow—copy template, adjust hostnames/IPs per target environment, then distribute tailored configs to each machine. Algorithm—preserves neighbor graph while modifying transport endpoints, ensuring cross-host gRPC connections remain valid. Useful for staging distributed deployments without editing single-machine configs in-place.
 
 ## Supported Query Filters & Data Partitioning
 
@@ -306,30 +395,30 @@ python scripts/performance_test.py --server 192.168.1.10:50051 --output results/
 ```
 
 ### client/advanced_client.py
-- Class `ProgressTracker`: tracks chunk counts, total results, elapsed time, and prints textual progress bars.
-- `test_chunked_streaming(stub, chunk_size)`: fetches PM2.5 data with moderate AQI filter to highlight chunk delivery.
-- `test_cancellation(stub, chunk_size, cancel_after_chunks)`: triggers cancellation mid-stream and confirms server response.
-- `test_status_tracking(stub)`: spawns status polling thread while streaming and logs snapshots.
-- `test_small_chunks(stub)`: runs query with small chunk size to emphasize progressive streaming.
-- `main()`: orchestrates connection, runs all scenarios with pauses, and summarizes features demonstrated.
+- Class `ProgressTracker`: Flow—initialized with `request_id`, records `start_time`, counters, flags. Algorithm—`update(chunk)` increments chunk counters and measurement tally; `display()` renders 40-character progress bar with Unicode blocks, deriving percent complete from `chunks_received/total_chunks`; `finish()` calls `display()` then prints newline. Structures—stores aggregate metrics to summarize stream after completion/cancellation.
+- `test_chunked_streaming(stub, chunk_size)`: Flow—build filtered `QueryRequest`, instantiate `ProgressTracker`, iterate `stub.Query`, update tracker, sleep 50 ms per chunk for readability, and conclude with summary. Algorithm—validates progressive delivery by tracking chunk and measurement counts; handles `grpc.RpcError` to report transport failures.
+- `test_cancellation(stub, chunk_size, cancel_after_chunks)`: Flow—issue broad query (no filters) to maximize results, update tracker per chunk, invoke `CancelRequest` once `chunks_received` hits threshold, set `tracker.cancelled`, and break loop. Algorithm—demonstrates control path by verifying gateway acknowledges cancellation and halts stream; prints pre-cancel progress metrics.
+- `test_status_tracking(stub)`: Flow—spawn daemon thread polling `GetStatus` every 0.5 s while main thread consumes stream; store snapshots in list, join thread after streaming completes. Algorithm—shows asynchronous status monitoring by correlating `status_resp.chunks_delivered` with tracker metrics; handles thread shutdown via `Event`.
+- `test_small_chunks(stub)`: Flow—construct request with tiny `max_results_per_chunk` (100), iterate stream with small sleep, emphasize high chunk counts, and print totals afterward. Algorithm—stress-tests chunk boundary logic and ensures tracker handles many small responses.
+- `main()`: Flow—connect to gateway (`localhost:50051`), create stub, call each test with 1-second pauses, close channel, summarize outcomes. Algorithm—wraps invocation in `try/except` to surface connectivity issues, prints deployment checklist on failure, handles `KeyboardInterrupt` gracefully.
 
 ### client/client.cpp
-- `FireQueryClient` constructor: binds to gRPC channel and creates C++ stub.
-- `Query(request_id, parameters, min_aqi, max_aqi)`: builds `QueryRequest`, streams results, prints chunk metadata, and sample measurements.
-- `GetStatus(request_id)`: calls `GetStatus` RPC and prints chunk counters.
-- `CancelRequest(request_id)`: invokes cancellation RPC for demo.
-- `main(argc, argv)`: configures server address (optional CLI override), instantiates `FireQueryClient`, and runs sequential query/status/cancel demonstration.
+- `FireQueryClient` constructor: Flow—store channel pointer, create synchronous stub via `FireQueryService::NewStub(channel)`. Structures—owns `std::unique_ptr<FireQueryService::Stub>` used by all member methods.
+- `Query(int64_t request_id, const std::vector<std::string>& parameters, int min_aqi, int max_aqi)`: Flow—populate `QueryRequest` (add parameters, set AQI bounds, request chunking), call `stub_->Query` to obtain `std::unique_ptr<ClientReader<QueryResponseChunk>>`, loop on `reader->Read(&chunk)` to stream results. Algorithm—tracks chunk index, prints metadata and first measurement from each chunk, handles end-of-stream by calling `reader->Finish()` and reporting grpc status.
+- `GetStatus(int64_t request_id)`: Flow—populate `StatusRequest` with `action="status"`, call `stub_->GetStatus`, print status text and chunk counters. Algorithm—demonstrates synchronous unary RPC invocation, handling `grpc::Status` failure by logging error code/message.
+- `CancelRequest(int64_t request_id)`: Flow—send `StatusRequest(action="cancel")`, print gateway response. Algorithm—mirrors Python demo, capturing partial progress metrics if available.
+- `main(int argc, char** argv)`: Flow—parse optional CLI arg for server address (default `localhost:50051`), instantiate `FireQueryClient`, call `Query`, `GetStatus`, `CancelRequest` in sequence. Algorithm—wraps each call in try/catch for `std::exception`, logs errors, returns non-zero on failure; ensures gRPC channel created via `grpc::CreateChannel` with insecure credentials.
 
 ### scripts/performance_test.py
-- Class `PerformanceMetrics`: captures start/end time, chunk timings, measurement counts, computes throughput and chunk statistics via `get_results`.
-- `run_query_test(stub, test_name, query_filter, chunk_size)`: core runner that streams results while tracking metrics and printing progress.
-- `test_small_query`, `test_medium_query`, `test_large_query`, `test_no_filter_query`: convenience wrappers passing different filter profiles.
-- `concurrent_query_worker(...)`: thread worker function to execute `run_query_test` concurrently.
-- `test_concurrent_queries(server_address, num_clients, chunk_size)`: spawns multiple threads (each with its own channel) to stress concurrency and aggregates metrics.
-- `run_all_tests(server_address)`: orchestrates chunk-size suite, query-complexity suite, and concurrent suite; collects results into structured dict.
-- `save_results(results, output_file)`: writes JSON summary to disk.
-- `print_summary(results)`: formats key metrics in human-readable summary.
-- `main()`: parses CLI arguments, runs full suite, prints summary, saves results, and handles exceptions.
+- Class `PerformanceMetrics`: wraps timing bookkeeping; records wall-clock start/stop, track per-chunk arrival durations, measurement totals, and computes derived stats (`chunks_per_second`, etc.) via `get_results`.
+- `run_query_test(stub, test_name, query_filter, chunk_size)`: central harness that issues a query, feeds each chunk into `PerformanceMetrics.record_chunk`, prints progress, and returns the metrics structure.
+- `test_small_query`, `test_medium_query`, `test_large_query`, `test_no_filter_query`: convenience wrappers that build representative `QueryFilter` objects (scoped parameters, date windows, or wide-open) before delegating to `run_query_test`.
+- `concurrent_query_worker(...)`: worker runnable executed in separate threads; each worker opens its own channel, runs `run_query_test`, and appends results into a thread-safe queue.
+- `test_concurrent_queries(server_address, num_clients, chunk_size)`: spawns multiple workers, waits for them to finish, and aggregates the collected metrics to report concurrency behaviour.
+- `run_all_tests(server_address)`: orchestrates the entire suite—individual chunk sizes, varied query scopes, and the concurrent stress test—returning a nested dictionary keyed by scenario name.
+- `save_results(results, output_file)`: serializes metrics into JSON and writes them to disk for later analysis.
+- `print_summary(results)`: pretty-prints key metrics to stdout so CI or humans can quickly inspect throughput and latency data.
+- `main()`: parses CLI arguments (`--server`, `--chunk`, `--output`, `--clients`), wires logging, invokes `run_all_tests`, prints the summary, and persists the report.
 
 ### scripts/build_cpp_client.sh
 - Checks/creates `build` directory, runs CMake configuration, invokes `make` to compile C++ client and servers, prints post-build instructions.
