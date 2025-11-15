@@ -205,6 +205,106 @@ Identical structure to Process C and D but serving Sep 14-24 data partition excl
 - `main()`: establishes gRPC channel to gateway, instantiates stub, and sequentially runs test trio.
 - Demonstrates idiomatic Python gRPC client usage (channel creation, stub instantiation, consuming streaming responses); treat it as the minimal reproducible example when onboarding new developers.
 
+## Supported Query Filters & Data Partitioning
+
+### Query Capabilities
+Client requests populate `QueryFilter` (defined in `fire_service.proto`), enabling combinations of:
+- **Parameters** (`parameters` repeated field): OR semantics—results include measurements whose pollutant/metric matches any supplied parameter (e.g., `PM2.5`, `PM10`, `OZONE`, `NO2`, `SO2`, `CO`).
+- **Site names** (`site_names` repeated field): OR semantics—restricts results to specific monitoring locations.
+- **AQS codes / Agency names** (`aqs_codes`, `agency_names`): additional identifiers for site-based filtering.
+- **Geospatial bounds** (`min_latitude`, `max_latitude`, `min_longitude`, `max_longitude`): rectangular bounding box on latitude/longitude.
+- **Datetime window** (`min_datetime`, `max_datetime`): ISO timestamp strings bounding measurement timestamps.
+- **Concentration/AQI ranges** (`min_concentration`, `max_concentration`, `min_aqi`, `max_aqi`): numeric lower/upper bounds; filters combine with other criteria using AND semantics.
+
+Workers interpret filters as follows:
+1. Start from parameter/site list (if provided) to build candidate indices (OR logic within the list).
+2. Apply numeric/date/geographic bounds (AND logic) to refine matches.
+3. Construct `FireMeasurement` protos for indices that satisfy all provided constraints.
+
+Leaders aggregate local matches using the same logic before forwarding to workers, and the gateway preserves `query_type` for future extension (current implementation treats non-empty filters uniformly).
+
+### Data Separation Across Processes
+CSV data resides under `data/` and is partitioned by date-oriented subdirectories (e.g., `20200810` through `20200924`). Each process loads a distinct slice via `data_partition.directories` in its config:
+
+| Process | Directories (inclusive) | Date Range |
+|---------|-------------------------|------------|
+| B (Team Green leader) | `20200810` – `20200817` | Aug 10–17 |
+| C (Team Green worker) | `20200818` – `20200826` | Aug 18–26 |
+| D (Shared worker)     | `20200827` – `20200904` | Aug 27–Sep 4 |
+| E (Team Pink leader)  | `20200905` – `20200913` | Sep 5–13 |
+| F (Team Pink worker)  | `20200914` – `20200924` | Sep 14–24 |
+
+- **No overlap**: Partitions are mutually exclusive, ensuring each measurement is owned by exactly one process.
+- **Leaders act as workers**: Processes B and E load their own subsets and can satisfy queries without contacting downstream workers when filters stay within their date ranges.
+- **Gateway**: Process A does not load data; it coordinates requests/responses and can be extended to cache results if needed.
+- **Multi-machine deployment**: These partitions inform which directories must be present on each host when distributing processes across computers.
+
+### Example Query Scenarios
+```python
+# Python client: moderate AQI PM2.5 query with chunking
+request = fire_service_pb2.QueryRequest(
+    request_id=12345,
+    filter=fire_service_pb2.QueryFilter(
+        parameters=["PM2.5"],
+        min_aqi=0,
+        max_aqi=100
+    ),
+    query_type="filter",
+    require_chunked=True,
+    max_results_per_chunk=500
+)
+for chunk in stub.Query(request):
+    print(f"Chunk {chunk.chunk_number + 1}/{chunk.total_chunks} -> {len(chunk.measurements)} measurements")
+```
+
+```python
+# Python client: geographic + datetime window across teams
+request = fire_service_pb2.QueryRequest(
+    request_id=67890,
+    filter=fire_service_pb2.QueryFilter(
+        min_latitude=37.0,
+        max_latitude=39.0,
+        min_longitude=-123.0,
+        max_longitude=-121.0,
+        min_datetime="2020-09-01T00:00:00",
+        max_datetime="2020-09-10T23:59:59"
+    ),
+    query_type="filter",
+    require_chunked=True,
+    max_results_per_chunk=1000
+)
+response_stream = stub.Query(request)
+```
+
+```cpp
+// C++ client: combine parameter and site filters
+QueryRequest request;
+request.set_request_id(22222);
+request.set_query_type("filter");
+request.set_require_chunked(true);
+request.set_max_results_per_chunk(250);
+
+QueryFilter* filter = request.mutable_filter();
+filter->add_parameters("OZONE");
+filter->add_parameters("NO2");
+filter->add_site_names("Oakland West");
+filter->set_min_aqi(50);
+filter->set_max_aqi(150);
+
+ClientContext context;
+auto reader = stub_->Query(&context, request);
+QueryResponseChunk chunk;
+while (reader->Read(&chunk)) {
+    std::cout << "Received chunk " << chunk.chunk_number() + 1
+              << " with " << chunk.measurements_size() << " records\n";
+}
+```
+
+```bash
+# CLI: run performance test with specific chunk size
+python scripts/performance_test.py --server 192.168.1.10:50051 --output results/scenario_pm25.json
+```
+
 ### client/advanced_client.py
 - Class `ProgressTracker`: tracks chunk counts, total results, elapsed time, and prints textual progress bars.
 - `test_chunked_streaming(stub, chunk_size)`: fetches PM2.5 data with moderate AQI filter to highlight chunk delivery.
