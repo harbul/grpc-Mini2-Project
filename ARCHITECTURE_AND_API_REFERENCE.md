@@ -1,6 +1,94 @@
 # Fire Query System Architecture & API Guide
 
+> **New to the project? Start here.** This guide now opens with a plain-language orientation so you can get hands-on quickly before diving into the dense reference material that follows.
+
+## Quick Orientation for New Teammates
+- **What we are building**: a gRPC-based info service that answers wildfire air-quality queries by fanning out to multiple Python and C++ microservices. Think of Process A (gateway) as the traffic cop, Processes B/E as regional leads, and Processes C/D/F as data workers.
+- **How to get productive in an afternoon**
+    1. Skim the "System Topology" diagram below to understand who talks to whom.
+    2. Run the end-to-end smoke test: `python client/test_client.py` while the servers are up (see Runbook section for exact commands).
+    3. With a debugger or print statements, follow one request through `gateway/server.py` ➜ `team_green/server_b.py` ➜ `team_green/server_c.cpp` to see the full round trip.
+    4. Only after that, return to the detailed tables for deeper API semantics.
+- **Where to look first**: if you are a Python engineer, prioritize `gateway/server.py` and `team_green/server_b.py`; if you are focusing on C++, head for `team_green/server_c.cpp` and `common/FireColumnModel.cpp`.
+- **How this document is structured**: high-level concepts and quickstart steps come first, followed by in-depth API breakdowns, module references, and deployment notes. Whenever the information gets heavy, use the "Learning Roadmap" later in the file as a bookmark trail.
+- **Terminology safety net**: unfamiliar names (e.g., *InternalQuery*, *FireColumnModel*) are defined in the Glossary at the end of this orientation. Refer back to it whenever an RPC or data structure is mentioned.
+
+### Glossary (Keep Handy)
+- **Gateway (Process A)**: The Python entry point that every client talks to. It fans requests out to the rest of the mesh, slices results into chunks, maintains per-request status, and handles cancellations.
+- **Leader**: A Python intermediary (Processes B and E) that both hosts its own data partition and delegates to workers. Think of leaders as regional coordinators.
+- **Worker**: A C++ microservice (Processes C, D, F) that holds a specific slice of the dataset and executes `InternalQuery` filters. Workers never speak to clients directly.
+- **InternalQuery**: Private RPC used between gateway↔leaders and leaders↔workers. Carries the same filters as client queries but is not exposed outside the cluster.
+- **FireColumnModel**: Our in-memory columnar store (Python and C++ versions) that ingests CSV files, maintains aligned vectors for each field, and accelerates lookups using inverted indexes.
+- **Chunk**: One streamed `QueryResponseChunk` emitted by the gateway. Chunks let clients start consuming results while the system is still processing later data.
+- **Request ID**: A client-assigned integer that threads through every RPC so status calls and cancellations target the correct in-flight query.
+- **Data partition**: A set of date-specific directories assigned to one process via the JSON config. Ensures no duplication across services.
+- **Active requests**: The gateway’s dictionary that tracks lifecycle state (`pending`, `cancelled`, `completed`) and chunk counters for each `request_id`.
+- **StatusResponse**: Unified reply message returned by `CancelRequest`, `GetStatus`, and `Notify`. Contains status text plus chunk counters when relevant.
+- **Cancellation**: Client-initiated stop request. The gateway honors it mid-stream; leaders/workers currently log acknowledgements but do not preempt computation.
+- **Neighbor**: Another process specified in a config JSON that this service knows how to reach via gRPC. Leaders list their workers; gateway lists leaders.
+- **QueryFilter**: Protobuf message defining what the client wants (parameters, AQI range, geo box, datetime window). Passed unchanged through the entire call stack.
+- **Runbook**: Documented set of terminal commands in this guide that brings the full system up on a development machine.
+- **Smoke test**: Minimal client run (`python client/test_client.py`) that verifies connectivity and basic chunked streaming.
+
+> 💡 **Tip:** If you ever feel lost, jump to "Learning Roadmap" for a curated order of files/scripts to read, or "Environment Setup & Runbook" for concrete commands to run next.
+
+Related reading (open in a second tab):
+- `START_HERE.md` for the overall course timeline and expectations.
+- `PROJECT_SUMMARY.md` and `WORK_COMPLETE_SUMMARY.md` for milestone context.
+- `SINGLE_COMPUTER_COMPLETE.md` and `MULTI_COMPUTER_SETUP.md` for deployment walkthroughs.
+- `scripts/README_TESTING.md` for deeper coverage of test scripts referenced later in this guide.
+
+## Visual Cheat Sheet
+- **High-level request flow** (follow the arrows to see how a query moves through the system):
+
+```
+Client → Gateway (A)
+       ↘          ↙
+    Leader B      Leader E
+     ↓   ↘        ↙   ↓
+    Worker C   Worker D   Worker F
+```
+
+- **Detailed sequence** (each step maps to a log message you will see during debugging):
+
+```
+1. Client sends Query(request_id)
+2. Gateway records request_id in active_requests
+3. Gateway issues InternalQuery to Leader B and Leader E
+4. Leaders run local filters, then fan out to workers with InternalQuery
+5. Workers return FireMeasurements to their leader
+6. Leaders aggregate and reply to Gateway
+7. Gateway slices results into QueryResponseChunk messages
+8. Client receives chunks until the stream ends or is cancelled
+```
+
+- **Startup order** (keep a copy next to your terminals):
+
+```
+[1] ./build/server_c configs/process_c.json    (Worker C)
+[2] ./build/server_d configs/process_d.json    (Worker D)
+[3] ./build/server_f configs/process_f.json    (Worker F)
+[4] python team_green/server_b.py configs/process_b.json  (Leader B)
+[5] python team_pink/server_e.py configs/process_e.json    (Leader E)
+[6] python gateway/server.py configs/process_a.json        (Gateway A)
+```
+
+- **Request lifecycle timeline** (useful when reading logs):
+
+```
+┌─────────────────────┬─────────────────────────────┐
+│ Time                │ Event                       │
+├─────────────────────┼─────────────────────────────┤
+│ t0                  │ Gateway<Query> start        │
+│ t0 + ε              │ active_requests entry added │
+│ t0 + 1 RPC round    │ Leaders + workers respond   │
+│ t0 + N chunk loops  │ Gateway streams chunks      │
+│ t0 + completion     │ _mark_completed + cleanup   │
+└─────────────────────┴─────────────────────────────┘
+```
+
 ## System Topology
+*Skim this diagram before reading code—understanding the traffic pattern makes the rest of the doc easier to digest.*
 ```
 Python/C++ Clients (CLI, scripts)
           |
@@ -25,6 +113,7 @@ Process C Worker  Process D Worker (shared)
 - Workers host columnar partitions via `FireColumnModel` (Python or C++ implementations) to satisfy filters.
 
 ## Frameworks, Libraries, and Tooling
+*Use this as a checklist when your environment fails to build or run; you do not need to memorize every dependency up front.*
 - **gRPC + Protocol Buffers**
     - Core contract lives in `proto/fire_service.proto`.
     - Python stubs (`fire_service_pb2.py`, `fire_service_pb2_grpc.py`) are generated via `python -m grpc_tools.protoc` or `make proto`.
@@ -64,6 +153,7 @@ Whenever you modify `fire_service.proto`, rerun `make proto` (or the equivalent 
 Configuration JSON files under `configs/` wire process identity, ports, neighbors, and directory partitions.
 
 ## RPC API Surface
+*Need just the contract? Start here. When you need implementation details, jump down to “API Deep Dive.”*
 | RPC Method      | Direction            | Request Type             | Response Type           | Behavior |
 |-----------------|----------------------|--------------------------|-------------------------|----------|
 | `Query`         | Client -> Gateway    | `QueryRequest`           | stream `QueryResponseChunk` | Executes filtered query, streams chunked measurements, tracks cancellation and status. |
@@ -80,6 +170,7 @@ Configuration JSON files under `configs/` wire process identity, ports, neighbor
 - **`Notify` (process ➜ process)**: Serves as a lightweight control-plane hook; every process logs the sender and replies with `status="acknowledged"`, keeping the RPC available for future health pings or cache invalidations.
 
 ## API Deep Dive
+*Reference section for when you are modifying behavior—feel free to skim on your first pass and return when implementing changes.*
 - **Query**
     - `gateway/server.py`: Registers inbound `request_id`, logs metadata, and stores lifecycle fields (`status`, `chunks_sent`, timers) inside `active_requests` guarded by `request_lock`. The gateway invokes `forward_to_team_leaders`, waits for both responses, flattens the returned `FireMeasurement` protos, and chunks them using the requested `max_results_per_chunk`. During streaming, the gateway enforces cancellation (`_is_cancelled`), client liveness (`context.is_active()`), and updates telemetry counters (`_update_chunks_sent`). Workload: CPU spent on serialization and slicing; memory pressure determined by combined leader payload size (worst-case accumulates all measurements before chunking).
     - `team_green/server_b.py` and `team_pink/server_e.py`: Leaders execute `_query_local_data`, which leverages the Python column store to assemble candidate indices, intersect numeric/date/geospatial constraints, and build `FireMeasurement` protos in-memory. They then run `forward_to_workers`, which issues synchronous `InternalQuery` calls to each neighbor, concatenating payloads and logging per-worker counts. No chunking occurs at this tier; leaders return the entire aggregated list to the gateway. Workload: dominated by filter evaluation and proto construction; latency proportional to worker RPC round-trips.
@@ -105,6 +196,7 @@ Configuration JSON files under `configs/` wire process identity, ports, neighbor
 - `StatusRequest/Response`: `action` nouns (`cancel`, `status`, etc.) and progress metrics.
 
 ## Module, Class, and Function Reference
+*Treat this like an encyclopedia—look up a module when you need specifics rather than reading linearly.*
 
 ### proto/fire_service.proto (Contract Source of Truth)
 - Declares package `fire_service`, all message types, and the `FireQueryService` RPCs.
@@ -438,7 +530,7 @@ python scripts/performance_test.py --server 192.168.1.10:50051 --output results/
 
 ## Configuration & Data Partitioning
 - Each `configs/process_*.json` defines `identity`, `role`, `team`, network endpoint, neighbor list, and `data_partition.directories` specifying subfolders under `data/` for that process.
-- `configs/multi_computer/*.json` provides templates for distributing processes across multiple machines.
+- `configs/multi_computer/*.json` provides templates for distributing processes across multiple machines (see `MULTI_COMPUTER_SETUP.md` for annotated deployment examples).
 - Gateway uses only neighbor connections; leaders/workers rely on partition filtering to avoid duplicate reads.
 
 ## Learning Roadmap
@@ -458,19 +550,6 @@ python scripts/performance_test.py --server 192.168.1.10:50051 --output results/
 - **Testing**: `scripts/performance_test.py` writes JSON summary to `results/single_computer.json`; markdown under `results/` documents findings.
 
 Use this guide as the canonical map of the codebase: each module summary above enumerates the exported functions or methods, while the API reference grounds how processes communicate. Combining request tracing with the learning roadmap will fast-track familiarity with the entire assignment implementation.
-
-## Onboarding Study Plan
-1. **`proto/fire_service.proto`** – internalize the RPC contract and message schemas first; keep it open as a reference.
-2. **`ARCHITECTURE_AND_API_REFERENCE.md` (this file)** – skim topology and request walkthrough to build a mental model.
-3. **`gateway/server.py`** – read the `FireQueryServiceImpl` class top-to-bottom; this is the critical coordinator that exercises every concept in the assignment. Pay special attention to `Query` and `forward_to_team_leaders`.
-4. **`team_green/server_b.py`** – study how a leader queries its local data and workers; compare with `team_pink/server_e.py` for symmetry.
-5. **`team_green/server_c.cpp`** – review the C++ worker implementation to understand how the columnar model is used in a lower-level language; follow up with `server_d.cpp` and `server_f.cpp` (differences are partitions and neighbor interactions).
-6. **`common/fire_column_model.py` and `common/FireColumnModel.cpp`** – learn the column store internals, indexing strategies, and CSV ingestion logic.
-7. **Client tools** – run through `client/test_client.py` to see simple usage, then `client/advanced_client.py` for Phase 2 features, and finally `client/client.cpp` if you intend to extend the C++ ecosystem.
-8. **Automation scripts** – inspect `scripts/performance_test.py`, `test_phase2.sh`, and `scripts/test_network.sh` to understand testing, diagnostics, and orchestration patterns.
-9. **Configs and build assets** – glance over `configs/*.json`, `CMakeLists.txt`, and `Makefile` to see how the environment is wired together.
-
-Following this order ensures that new developers first grasp the shared protocol, then the orchestration layer, then the data/worker internals, and finally the tooling that exercises the system.
 
 ## End-to-End Request Walkthrough
 1. **Client call** – a client (Python or C++) instantiates a stub against `localhost:50051` and calls `Query` with a `QueryRequest` that includes `request_id`, a `QueryFilter`, and streaming hints.
@@ -493,11 +572,12 @@ Tracing this flow in logs while running `client/advanced_client.py` or `test_pha
 - **Client progress trackers**: Python advanced client maintains chunk counts and total result counters to showcase incremental delivery; these classes demonstrate expected semantics for clients you may write.
 
 ## Environment Setup & Runbook
+*Copy/paste these commands the first time you spin up the system; iterate from there once the basics work.*
 1. **Create Python environment**
     - `make venv` to create `.venv` or `python3 -m venv venv`; `source venv/bin/activate`.
     - `pip install -r requirements.txt` to pull gRPC tooling.
 2. **Generate protobuf bindings**
-    - `make proto` (or `python -m grpc_tools.protoc -I proto --python_out=proto --grpc_python_out=proto proto/fire_service.proto`).
+    - `make proto` (or `python -m grpc_tools.protoc -I proto --python_out=proto --grpc_python_out=proto proto/fire_service.proto`). See `scripts/README_BUILD.md` if you need a deeper walkthrough of the build targets.
     - Ensures both Python and C++ generated code are up to date before builds.
 3. **Build C++ binaries**
     - `make servers` (wraps CMake configure + build), or run `scripts/build_cpp_client.sh`.
@@ -506,16 +586,16 @@ Tracing this flow in logs while running `client/advanced_client.py` or `test_pha
     - In six terminals: start C++ workers (`build/server_c configs/process_c.json`, etc.), Python leaders (`python team_green/server_b.py configs/process_b.json`), and gateway (`python gateway/server.py configs/process_a.json`).
     - Alternatively execute `test_phase2.sh` to spin everything up automatically.
 5. **Run clients**
-    - Basic sanity: `python client/test_client.py`.
-    - Feature demo: `python client/advanced_client.py`.
+    - Basic sanity: `python client/test_client.py` (documented in `scripts/README_TESTING.md`).
+    - Feature demo: `python client/advanced_client.py` (also covered in `scripts/README_TESTING.md`).
     - C++ example: `build/client localhost:50051` (after compiling).
 6. **Shutdown**
-    - Use Ctrl+C in each terminal or press Enter when prompted by `test_phase2.sh`; processes will stop and clean logs.
+    - Use Ctrl+C in each terminal or press Enter when prompted by `test_phase2.sh`; processes will stop and clean logs. Reference `scripts/README_TESTING.md` for log locations and troubleshooting tips.
 
 ## Testing & Diagnostics Checklist
-- `scripts/test_network.sh`: manual smoke test to ensure RPC pathways are healthy.
-- `test_phase2.sh`: orchestrated integration test covering chunked streaming, cancellation, and status tracking; collects logs under `/tmp/server_*.log` for inspection.
-- `scripts/performance_test.py`: benchmark suite producing `results/single_computer.json` and enabling chunk-size/concurrency experimentation.
+- `scripts/test_network.sh`: manual smoke test to ensure RPC pathways are healthy (quickstart in `scripts/README_TESTING.md`).
+- `test_phase2.sh`: orchestrated integration test covering chunked streaming, cancellation, and status tracking; collects logs under `/tmp/server_*.log` for inspection (see the same README for expected output snippets).
+- `scripts/performance_test.py`: benchmark suite producing `results/single_computer.json` and enabling chunk-size/concurrency experimentation (scenario breakdowns are documented in `scripts/README_TESTING.md`).
 - Logging tips:
   - Gateway logs chunk transmission counts; confirm progressive streaming and cancellation events here.
   - Team leaders log local match counts and worker contributions; use these to verify partition coverage.
